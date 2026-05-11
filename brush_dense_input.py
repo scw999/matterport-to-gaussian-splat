@@ -39,6 +39,7 @@ from matterport_to_colmap import (
     discover_face_images,
 )
 from dense_perspective import FACE_TO_DIR, FACE_ROTATION_90, load_cube_faces, cubemap_to_equirect
+from multiband_equirect import build_seamless_equirect
 
 
 def look_at_R_opencv(az_deg: float, el_deg: float) -> np.ndarray:
@@ -84,22 +85,25 @@ def render_perspective_from_cube(
     az: float,
     el: float,
     out_size: int,
-    blend_deg: float = 10.0,
+    blend_deg: float = 0.0,
 ) -> np.ndarray:
-    """Direct cube → perspective via ray casting with cross-face blending.
+    """Direct cube → perspective via ray casting with hard per-pixel face
+    assignment.
 
-    Each output pixel's ray is computed in sweep-local. Faces whose look
-    direction is within (45° + blend_deg) of the ray contribute, weighted by
-    cosine of angular distance to face center past the (45° − blend_deg)
-    threshold. Boundaries between cube faces are smoothed over a `blend_deg`
-    wide angular band — fixes the diagonal seams that appear when a view
-    crosses cube corners (e.g., az~315°, el~−30°) due to Matterport's
-    per-face calibration drift.
+    Each output pixel's ray is computed in sweep-local, the dominant axis
+    determines the unique cube face it samples, and that face's image is
+    bilinear-interpolated at the projected (u, v).
 
-    Note: cube corners where 3 faces meet are at acos(1/√3) ≈ 54.74° from any
-    face center, so `blend_deg` must be ≥ 10° to keep those corner pixels
-    covered (otherwise black triangles appear).
+    `blend_deg` is accepted for API compatibility but ignored — cross-face
+    blending was tried but caused ghosting/double-exposure of close-up
+    objects (chairs, table legs) due to Matterport's per-cube-face parallax
+    (the panoramic camera has spatially offset lenses, so each face captures
+    a slightly different viewpoint of the same scene). Blending two faces
+    with parallax-shifted content of the same object produces ghosts. Hard
+    assignment leaves a faint seam at cube boundaries from calibration
+    drift, but no ghosts — GS training handles the seam better.
     """
+    del blend_deg
     fx = fy = out_size / (2.0 * math.tan(math.radians(fov) / 2.0))
     cx = cy = out_size / 2.0
     j_grid, i_grid = np.meshgrid(np.arange(out_size), np.arange(out_size))
@@ -112,50 +116,47 @@ def render_perspective_from_cube(
     R_cam2sweep = look_at_R_opencv(az, el).astype(np.float32)
     rays_sweep = rays_cam @ R_cam2sweep.T  # H, W, 3
 
-    cos_cutoff = math.cos(math.radians(45.0 + blend_deg))
     H, W = out_size, out_size
+    abs_xyz = np.abs(rays_sweep)
+    max_axis = np.argmax(abs_xyz, axis=-1)
+    sign_pos = rays_sweep > 0  # H, W, 3
 
-    # Vectorize cosines across all 6 faces in one matmul
-    look_stack = np.stack([face_R_cam2sweep[fi][:, 2] for fi in range(6)]).astype(np.float32)  # 6, 3
-    cosines_all = rays_sweep @ look_stack.T  # H, W, 6
-    weights_all = np.maximum(0, cosines_all - cos_cutoff)  # H, W, 6
+    out = np.zeros((H, W, 3), dtype=np.uint8)
 
-    accum_color = np.zeros((H, W, 3), dtype=np.float32)
-    accum_weight = np.zeros((H, W), dtype=np.float32)
+    # Map each cube face to its (axis, positive-sign) signature
+    face_axis_sign: dict[int, tuple[int, bool]] = {}
+    for fi in range(6):
+        look = face_R_cam2sweep[fi][:, 2]
+        ax = int(np.argmax(np.abs(look)))
+        sg = bool(look[ax] > 0)
+        face_axis_sign[fi] = (ax, sg)
 
     for fi in range(6):
         face_arr = cube_arrs.get(fi)
         if face_arr is None:
             continue
-        weight = weights_all[..., fi]
-        if not (weight > 0).any():
+        ax, sg = face_axis_sign[fi]
+        mask = (max_axis == ax) & (sign_pos[..., ax] == sg)
+        if not mask.any():
             continue
 
-        # Project ray into face camera frame: rays_face = R_f2s.T @ ray ↔ rays_sweep @ R_f2s
         R_f2s = face_R_cam2sweep[fi].astype(np.float32)
-        rays_face = rays_sweep @ R_f2s  # H, W, 3
-        rz = rays_face[..., 2]
-        rz_safe = np.where(rz > 1e-9, rz, np.float32(1e-9))
-        u = np.clip(rays_face[..., 0] / rz_safe, -1.0, 1.0)
-        v = np.clip(rays_face[..., 1] / rz_safe, -1.0, 1.0)
+        rays_face = rays_sweep[mask] @ R_f2s  # N, 3
+        rz_safe = np.maximum(rays_face[:, 2], np.float32(1e-9))
+        u = rays_face[:, 0] / rz_safe
+        v = rays_face[:, 1] / rz_safe
 
         fh, fw = face_arr.shape[:2]
         px = (u + 1.0) * 0.5 * (fw - 1)
         py = (v + 1.0) * 0.5 * (fh - 1)
-        # map_coordinates expects (row, col) order
-        coords = np.stack([py.ravel(), px.ravel()])
+        coords = np.stack([py, px])
 
-        sample = np.empty((H * W, 3), dtype=np.float32)
+        sample = np.empty((rays_face.shape[0], 3), dtype=np.float32)
         for c in range(3):
             sample[:, c] = map_coordinates(face_arr[..., c], coords, order=1, mode="nearest")
-        sample = sample.reshape(H, W, 3)
+        out[mask] = np.clip(sample, 0, 255).astype(np.uint8)
 
-        accum_color += sample * weight[..., None]
-        accum_weight += weight
-
-    safe_w = np.where(accum_weight > 1e-9, accum_weight, 1.0)[..., None]
-    color = accum_color / safe_w
-    return np.clip(color, 0, 255).astype(np.uint8)
+    return out
 
 
 def main(args: argparse.Namespace) -> int:
@@ -244,29 +245,46 @@ def main(args: argparse.Namespace) -> int:
                     "w": cube_size, "h": cube_size,
                 })
 
-        # 2) Dense perspective views — direct cube-to-perspective (no equirect)
-        try:
-            cube_arrs: dict[int, np.ndarray] = {}
-            for fi in range(6):
-                src = face_files.get(fi)
-                if src is None:
-                    continue
-                with Image.open(src) as im:
-                    cube_arrs[fi] = np.array(im.convert("RGB"))
-        except Exception as e:
-            print(f"\n  ⚠ {sw.sweep_short[:8]}: cube load 실패 — perspective 뷰 스킵 ({e})", file=sys.stderr)
-            continue
+        # 2) Dense perspective views — build seamless equirect (Burt-Adelson
+        # multi-band blend) once per sweep, then sample perspectives from it.
+        # All-el=0 case can skip the equirect build entirely if every
+        # perspective file already exists.
+        all_persp_paths = [
+            (el, az,
+             images_out / f"scan{sweep_idx:03d}_{sw.sweep_short[:8]}_az{az:03d}_el{int(el):+03d}.jpg")
+            for el in elevations for az in azimuths
+        ]
+        need_render = any(not p.is_file() or not args.skip_existing
+                          for _, _, p in all_persp_paths)
 
-        face_R_cam2sweep = {fi: cube_face_R_cam2sweep(fi) for fi in range(6)}
+        equi = None
+        if need_render:
+            try:
+                cube_arrs: dict[int, np.ndarray] = {}
+                for fi in range(6):
+                    src = face_files.get(fi)
+                    if src is None:
+                        continue
+                    with Image.open(src) as im:
+                        cube_arrs[fi] = np.array(im.convert("RGB"))
+                face_R_cam2sweep = {fi: cube_face_R_cam2sweep(fi) for fi in range(6)}
+                equi = build_seamless_equirect(
+                    cube_arrs, face_R_cam2sweep, h=1536, w=3072, levels=6,
+                )
+            except Exception as e:
+                print(f"\n  ⚠ {sw.sweep_short[:8]}: equirect 빌드 실패 — perspective 뷰 스킵 ({e})", file=sys.stderr)
+                continue
 
         for el in elevations:
             for az in azimuths:
                 fname = f"scan{sweep_idx:03d}_{sw.sweep_short[:8]}_az{az:03d}_el{int(el):+03d}.jpg"
                 fpath = images_out / fname
                 if not fpath.is_file() or not args.skip_existing:
-                    persp = render_perspective_from_cube(
-                        cube_arrs, face_R_cam2sweep, fov, az, el, out_size,
+                    persp = py360convert.e2p(
+                        equi, fov_deg=fov, u_deg=az, v_deg=el,
+                        out_hw=(out_size, out_size), mode="bilinear",
                     )
+                    persp = np.clip(persp, 0, 255).astype(np.uint8)
                     Image.fromarray(persp).save(fpath, "JPEG", quality=92)
                 R_face2sweep = look_at_R_opencv(az, el)
                 R_c2w_cv = R_sweep @ R_face2sweep
