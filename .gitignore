@@ -1,4 +1,43 @@
-# Ignore everything
+# Original ignores
 downloads/
 output/
 defaults.json
+
+# Python
+venv/
+nerfstudio_env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Generated pipeline outputs
+perspective_images/
+perspective_images_2k/
+dense_views/
+brush_dense_input_*/
+gs_output_*/
+postshot_input/
+
+# Large artifacts
+*.zip
+*.ply
+*.glb
+*.ckpt
+
+# Diagnostic outputs (regenerable)
+_diagnose_*
+_face_*.png
+_face*_two_sweeps.png
+_test_*.png
+_compare_*.png
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude session state
+.claude/

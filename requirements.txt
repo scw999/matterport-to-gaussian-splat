@@ -4,3 +4,10 @@ curl-cffi==0.7.1
 aiofiles
 Pillow
 pyreadline3 ; platform_system=="Windows"
+numpy
+py360convert
+scipy
+trimesh
+pygltflib
+DracoPy
+matplotlib
