@@ -78,6 +78,81 @@ def render_perspective(equi: np.ndarray, fov: float, az: float, el: float, out_s
     return np.clip(p, 0, 255).astype(np.uint8)
 
 
+def sub_perspective_R_cam2sweep(
+    R_face_cam2sweep: np.ndarray,
+    x_off_deg: float,
+    y_off_deg: float,
+) -> np.ndarray:
+    """Build the output camera R for a sub-perspective offset within a cube face."""
+    tan_x = math.tan(math.radians(x_off_deg))
+    tan_y = math.tan(math.radians(y_off_deg))
+    look_face = np.array([tan_x, tan_y, 1.0], dtype=np.float64)
+    look_face /= np.linalg.norm(look_face)
+    look_sweep = R_face_cam2sweep @ look_face
+
+    image_up_in_face = np.array([0.0, -1.0, 0.0])
+    image_up_sweep = R_face_cam2sweep @ image_up_in_face
+    image_up_sweep = image_up_sweep - image_up_sweep.dot(look_sweep) * look_sweep
+    image_up_sweep /= np.linalg.norm(image_up_sweep)
+
+    cam_z = look_sweep
+    cam_y = -image_up_sweep
+    cam_x = np.cross(cam_y, cam_z)
+    cam_x /= np.linalg.norm(cam_x)
+    return np.column_stack([cam_x, cam_y, cam_z])
+
+
+def render_sub_perspective(
+    face_arr: np.ndarray,
+    R_face_cam2sweep: np.ndarray,
+    x_off_deg: float,
+    y_off_deg: float,
+    fov: float,
+    out_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Render a perspective view that samples *only* one cube face -- the
+    sub-view's FOV cone stays entirely inside the face's 90° region, so no
+    boundary crossing and no Matterport multi-lens parallax artifacts.
+
+    `x_off_deg`, `y_off_deg` shift the sub-view's optical center within the
+    face image. For FOV=50° the safe offset range is roughly ±15° on each
+    axis (boundary at ±45° minus half-FOV 25°).
+
+    Returns (image HxWx3 uint8, R_cam2sweep 3x3 for the sub-perspective).
+    """
+    R_out_cam2sweep = sub_perspective_R_cam2sweep(R_face_cam2sweep, x_off_deg, y_off_deg)
+
+    fx = fy = out_size / (2.0 * math.tan(math.radians(fov) / 2.0))
+    cx = cy = out_size / 2.0
+    j_grid, i_grid = np.meshgrid(np.arange(out_size), np.arange(out_size))
+    x = ((j_grid - cx) / fx).astype(np.float32)
+    y = ((i_grid - cy) / fy).astype(np.float32)
+    z = np.ones_like(x, dtype=np.float32)
+    rays_out = np.stack([x, y, z], axis=-1)
+    rays_out /= np.linalg.norm(rays_out, axis=-1, keepdims=True)
+
+    # Output cam -> sweep -> source face cam: rays_out @ (R_face^T @ R_out)^T
+    R_face_sweep_to_cam = R_face_cam2sweep.T.astype(np.float32)
+    M = (R_face_sweep_to_cam @ R_out_cam2sweep.astype(np.float32))  # out cam -> face cam
+    rays_face = rays_out @ M.T
+
+    rz = rays_face[..., 2]
+    rz_safe = np.where(rz > 1e-9, rz, np.float32(1e-9))
+    u = np.clip(rays_face[..., 0] / rz_safe, -1.0, 1.0)
+    v = np.clip(rays_face[..., 1] / rz_safe, -1.0, 1.0)
+
+    fh, fw = face_arr.shape[:2]
+    px = (u + 1.0) * 0.5 * (fw - 1)
+    py = (v + 1.0) * 0.5 * (fh - 1)
+    coords = np.stack([py.ravel(), px.ravel()])
+
+    sample = np.empty((out_size * out_size, 3), dtype=np.float32)
+    for c in range(3):
+        sample[:, c] = map_coordinates(face_arr[..., c], coords, order=1, mode="nearest")
+    out = np.clip(sample, 0, 255).astype(np.uint8).reshape(out_size, out_size, 3)
+    return out, R_out_cam2sweep
+
+
 def render_perspective_from_cube(
     cube_arrs: dict[int, np.ndarray],
     face_R_cam2sweep: dict[int, np.ndarray],
@@ -245,53 +320,58 @@ def main(args: argparse.Namespace) -> int:
                     "w": cube_size, "h": cube_size,
                 })
 
-        # 2) Dense perspective views — build seamless equirect (Burt-Adelson
-        # multi-band blend) once per sweep, then sample perspectives from it.
-        # All-el=0 case can skip the equirect build entirely if every
-        # perspective file already exists.
-        all_persp_paths = [
-            (el, az,
-             images_out / f"scan{sweep_idx:03d}_{sw.sweep_short[:8]}_az{az:03d}_el{int(el):+03d}.jpg")
-            for el in elevations for az in azimuths
-        ]
-        need_render = any(not p.is_file() or not args.skip_existing
-                          for _, _, p in all_persp_paths)
+        # 2) Sub-perspectives within each cube face (no boundary crossing).
+        # 9 sub-views per face × 6 faces = 54 perspective views per sweep, all
+        # sampling from a single face each => no Matterport multi-lens parallax
+        # artifacts, no seams, no ghosts. The native 6 cube faces above already
+        # cover the full sphere at 90° FOV.
+        sub_offsets_deg = [(-15.0, -15.0), (-15.0, 0.0), (-15.0, 15.0),
+                           (0.0, -15.0),   (0.0, 0.0),   (0.0, 15.0),
+                           (15.0, -15.0),  (15.0, 0.0),  (15.0, 15.0)]
+        sub_fov = 50.0  # safe FOV; offset ±15° + FOV/2 25° = 40° stays inside 45° face boundary
+        sub_fx = sub_fy = out_size / (2.0 * math.tan(math.radians(sub_fov) / 2.0))
+        sub_cx = sub_cy = out_size / 2.0
 
-        equi = None
-        if need_render:
-            try:
-                cube_arrs: dict[int, np.ndarray] = {}
-                for fi in range(6):
-                    src = face_files.get(fi)
-                    if src is None:
-                        continue
-                    with Image.open(src) as im:
-                        cube_arrs[fi] = np.array(im.convert("RGB"))
-                face_R_cam2sweep = {fi: cube_face_R_cam2sweep(fi) for fi in range(6)}
-                equi = build_seamless_equirect(
-                    cube_arrs, face_R_cam2sweep, h=1536, w=3072, levels=6,
-                )
-            except Exception as e:
-                print(f"\n  ⚠ {sw.sweep_short[:8]}: equirect 빌드 실패 — perspective 뷰 스킵 ({e})", file=sys.stderr)
-                continue
-
-        for el in elevations:
-            for az in azimuths:
-                fname = f"scan{sweep_idx:03d}_{sw.sweep_short[:8]}_az{az:03d}_el{int(el):+03d}.jpg"
+        cube_arrs: dict[int, np.ndarray] = {}
+        face_R_local = {fi: cube_face_R_cam2sweep(fi) for fi in range(6)}
+        loaded = False
+        for face_i in range(6):
+            face_arr = None
+            for x_off, y_off in sub_offsets_deg:
+                fname = (f"scan{sweep_idx:03d}_{sw.sweep_short[:8]}_"
+                         f"face{face_i}_x{int(x_off):+03d}_y{int(y_off):+03d}.jpg")
                 fpath = images_out / fname
-                if not fpath.is_file() or not args.skip_existing:
-                    persp = py360convert.e2p(
-                        equi, fov_deg=fov, u_deg=az, v_deg=el,
-                        out_hw=(out_size, out_size), mode="bilinear",
+                need_render = not fpath.is_file() or not args.skip_existing
+
+                if need_render and face_arr is None:
+                    src = face_files.get(face_i)
+                    if src is None:
+                        break
+                    if not loaded:
+                        cube_arrs.clear()
+                        loaded = True
+                    with Image.open(src) as im:
+                        face_arr = np.array(im.convert("RGB"))
+
+                if need_render:
+                    persp, R_sub_cam2sweep = render_sub_perspective(
+                        face_arr, face_R_local[face_i], x_off, y_off,
+                        fov=sub_fov, out_size=out_size,
                     )
-                    persp = np.clip(persp, 0, 255).astype(np.uint8)
                     Image.fromarray(persp).save(fpath, "JPEG", quality=92)
-                R_face2sweep = look_at_R_opencv(az, el)
-                R_c2w_cv = R_sweep @ R_face2sweep
+                else:
+                    R_sub_cam2sweep = sub_perspective_R_cam2sweep(
+                        face_R_local[face_i], x_off, y_off,
+                    )
+
+                R_c2w_cv = R_sweep @ R_sub_cam2sweep
                 c2w_gl = opencv_to_opengl_c2w(R_c2w_cv, sw.position)
                 frames.append({
                     "file_path": f"images/{fname}",
                     "transform_matrix": c2w_gl.tolist(),
+                    "fl_x": sub_fx, "fl_y": sub_fy,
+                    "cx": sub_cx, "cy": sub_cy,
+                    "w": out_size, "h": out_size,
                 })
 
     print(f"\nGenerated frames: {len(frames)}")
